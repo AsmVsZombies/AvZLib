@@ -5,6 +5,7 @@
 
 #if __AVZ_VERSION__ > 221001
 #include "mod_avz2.h"
+#include "rnd_avz2.h"
 #else
 #include "mod_avz1.h"
 #endif
