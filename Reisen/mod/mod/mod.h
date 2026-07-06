@@ -54,7 +54,7 @@ Mod CobInstantRecharge{
 
 // 小丑僵尸与辣椒僵尸不会爆炸
 Mod DisableJackExplode{
-    {0x5261fc, '\x81', '\x8f'},
+    {0x526afc, '\x81', '\x8f'},
     {0x5275dd, '\x81', '\x85'},
 };
 
