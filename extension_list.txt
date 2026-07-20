@@ -2,6 +2,7 @@ crescendo/AverageSpawn
 crescendo/Overwatch
 crescendo/SimpleAvZ
 Leonhardqwq/damage_recorder
+Leonhardqwq/line_up
 mint/ShowWavelength
 qrmd/GetZombieAbscissas
 qrmd/KeyAssistant
