@@ -13,7 +13,32 @@
 
 #include <avz.h>
 #include <commctrl.h>
+#include <filesystem>
 #include <windowsx.h>
+
+inline int _GetDpiForWindow(HWND hwnd)
+{
+    typedef UINT(WINAPI * GetDpiForWindowPtr)(HWND);
+    static GetDpiForWindowPtr pGetDpiForWindow = nullptr;
+    if (!pGetDpiForWindow) {
+        HMODULE hUser32 = GetModuleHandleW(L"user32.dll");
+        pGetDpiForWindow = (GetDpiForWindowPtr)GetProcAddress(hUser32, "GetDpiForWindow");
+    }
+    if (pGetDpiForWindow) {
+        UINT dpi = pGetDpiForWindow(hwnd);
+        if (dpi != 0)
+            return (int)dpi;
+    }
+    HDC hdc = GetDC(hwnd);
+    int dpi = GetDeviceCaps(hdc, LOGPIXELSX);
+    ReleaseDC(hwnd, hdc);
+    return dpi ? dpi : 96;
+}
+
+inline int _Scale(int value, int dpi)
+{
+    return MulDiv(value, dpi, 96);
+}
 
 class __AWindowClass : public AOrderedAfterInjectHook<-100>,
                        public AOrderedBeforeExitHook<100> {
@@ -34,6 +59,59 @@ public:
     __AWindowClass() = default;
 
 protected:
+
+#ifdef ENABLE_COMCTL32_V6
+
+    virtual void _AfterInject() override
+    {
+        _hInst = AGetDllInstance();
+
+        auto manifestPath = (std::filesystem::path(__FILE__).parent_path() / "win32gui.manifest").wstring();
+        ACTCTXW actCtx = {};
+        actCtx.cbSize = sizeof(actCtx);
+        actCtx.lpSource = manifestPath.c_str();
+        _hActCtx = CreateActCtxW(&actCtx);
+        if (_hActCtx != INVALID_HANDLE_VALUE) {
+            ActivateActCtx(_hActCtx, &_cookie);
+        }
+
+        _hComCtl32 = LoadLibraryW(L"comctl32.dll");
+        if (_hComCtl32 != nullptr) {
+            using InitCommonControlsExFunc = BOOL(WINAPI*)(const INITCOMMONCONTROLSEX*);
+            auto initCommonControlsEx = reinterpret_cast<InitCommonControlsExFunc>(
+                GetProcAddress(_hComCtl32, "InitCommonControlsEx"));
+            if (initCommonControlsEx != nullptr) {
+                INITCOMMONCONTROLSEX info = {sizeof(info), ICC_STANDARD_CLASSES};
+                initCommonControlsEx(&info);
+            }
+        }
+
+        WNDCLASSW wc = {};
+        wc.lpfnWndProc = _HandleMsg;
+        wc.hInstance = _hInst;
+        wc.lpszClassName = _wndClassName;
+        RegisterClassW(&wc);
+    }
+
+    virtual void _BeforeExit() override
+    {
+        if (_hActCtx != INVALID_HANDLE_VALUE) {
+            DeactivateActCtx(0, _cookie);
+            ReleaseActCtx(_hActCtx);
+            _hActCtx = INVALID_HANDLE_VALUE;
+        }
+        UnregisterClassW(_wndClassName, _hInst);
+        if (_hComCtl32 != nullptr) {
+            FreeLibrary(_hComCtl32);
+            _hComCtl32 = nullptr;
+        }
+    }
+
+    HANDLE _hActCtx = INVALID_HANDLE_VALUE;
+    HMODULE _hComCtl32 = nullptr;
+    ULONG_PTR _cookie = 0;
+
+#else
     virtual void _AfterInject() override
     {
         _hInst = AGetDllInstance();
@@ -49,6 +127,7 @@ protected:
         UnregisterClassW(_wndClassName, GetInstance());
     }
 
+#endif
     __AWindowClass(const __AWindowClass&) = delete;
     __AWindowClass& operator=(const __AWindowClass&) = delete;
 
@@ -78,6 +157,7 @@ protected:
         }
         return DefWindowProc(hwnd, msg, wParam, lParam);
     }
+
     static constexpr const wchar_t* _wndClassName = L"AWindow";
     HINSTANCE _hInst;
     inline static std::unordered_map<HWND, std::function<void()>> _opMap;
@@ -129,7 +209,8 @@ public:
         if (_font != nullptr) {
             DeleteObject(_font);
         }
-        _font = CreateFontW(fontSize, 0, 0, 0, isBold ? FW_BOLD : FW_MEDIUM, FALSE, FALSE, false, ANSI_CHARSET,
+        int scaledSize = _Scale(fontSize, _dpi);
+        _font = CreateFontW(scaledSize, 0, 0, 0, isBold ? FW_BOLD : FW_MEDIUM, FALSE, FALSE, false, ANSI_CHARSET,
             OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, DEFAULT_PITCH | FF_DONTCARE, AStrToWstr(name).c_str());
         if (_font == nullptr) {
             return false;
@@ -143,10 +224,22 @@ public:
 
     int GetWidth() const noexcept
     {
-        return _width;
+        return _logicWidth;
     }
 
     virtual int GetHeight()
+    {
+        return _logicHeight;
+    }
+
+    // 返回实际程序的宽度，即 经过dpi适应后的宽度
+    int GetPhysicalWidth() const noexcept
+    {
+        return _width;
+    }
+
+    // 返回实际程序的高度，即 经过dpi适应后的高度
+    int GetPhysicalHeight() const noexcept
     {
         return _height;
     }
@@ -179,32 +272,75 @@ public:
         return _isHide;
     }
 
+    int GetDpi() const noexcept
+    {
+        return _dpi;
+    }
+
+    int Scale(int value) const noexcept
+    {
+        return _Scale(value, _dpi);
+    }
+
 protected:
     void _CreateWindow(ABasicWindow* parent, const std::wstring& className, DWORD style,
         const std::string& text, int x, int y, int width = 0, int height = 0)
     {
-        if (parent != nullptr && (width <= 0 || height <= 0)) {
-            RECT rect;
-            GetClientRect(parent->GetHwnd(), &rect);
-            width = std::max<int>(10, rect.right - rect.left - x);
-            height = std::max<int>(10, rect.bottom - rect.top - y);
+        // 原始值
+        _logicX = x;
+        _logicY = y;
+        _logicWidth = width;
+        _logicHeight = height;
+
+        if (parent != nullptr) {
+            _dpi = parent->_dpi;
+            _font = parent->_font;
+            _isEnable = parent->_isEnable;
+            _isHide = parent->_isHide;
+        }
+
+        int finalX = x;
+        int finalY = y;
+        int finalW = width;
+        int finalH = height;
+
+        if (parent != nullptr) {
+            // 子控件按 DPI 缩放
+            finalX = _Scale(x, _dpi);
+            finalY = _Scale(y, _dpi);
+            finalW = _Scale(width, _dpi);
+            finalH = _Scale(height, _dpi);
+
+            // 未指定尺寸时填充剩余客户区
+            if (finalW <= 0 || finalH <= 0) {
+                RECT rect;
+                GetClientRect(parent->GetHwnd(), &rect);
+                finalW = std::max<int>(10, rect.right - rect.left - finalX);
+                finalH = std::max<int>(10, rect.bottom - rect.top - finalY);
+                _logicWidth = _Scale(finalW, 96);  // 得到逻辑宽度
+                _logicHeight = _Scale(finalH, 96); // 得到逻辑高度
+            }
         }
 
         if (parent != nullptr) {
             _hwnd = CreateWindowW(className.c_str(), AStrToWstr(text).c_str(), style,
-                x, y, width, height, parent->GetHwnd(), 0, AGetDllInstance(), 0);
+                finalX, finalY, finalW, finalH, parent->GetHwnd(), 0, AGetDllInstance(), 0);
             SendMessage(_hwnd, WM_SETFONT, (WPARAM)(parent->_font), 0);
             _parent = parent;
-            _font = parent->_font;
-            _isEnable = _parent->_isEnable;
-            _isHide = _parent->_isHide;
         } else {
             _hwnd = CreateWindowW(className.c_str(), AStrToWstr(text).c_str(), style,
-                x, y, width, height, nullptr, 0, AGetDllInstance(), 0);
+                finalX, finalY, finalW, finalH, nullptr, 0, AGetDllInstance(), 0);
+            if (_hwnd) {
+                _dpi = _GetDpiForWindow(_hwnd);
+                RECT rect;
+                GetWindowRect(_hwnd, &rect);
+                _width = rect.right - rect.left;
+                _height = rect.bottom - rect.top;
+            }
         }
 
-        _width = width;
-        _height = height;
+        _width = finalW;
+        _height = finalH;
         SetEnable(_isEnable);
         ShowWindow(_hwnd, _isHide ? SW_HIDE : SW_SHOW);
     }
@@ -212,8 +348,13 @@ protected:
     HWND _hwnd = nullptr;
     ABasicWindow* _parent = nullptr;
     HFONT _font = nullptr;
-    int _width = 0;
-    int _height = 0;
+    int _width = 0;       // 真实宽度
+    int _height = 0;      // 真实高度
+    int _logicX = 0;      // 逻辑 X
+    int _logicY = 0;      // 逻辑 Y
+    int _logicWidth = 0;  // 逻辑宽度
+    int _logicHeight = 0; // 逻辑高度
+    int _dpi = 96;
     std::vector<std::shared_ptr<ABasicWindow>> _childs;
     bool _isEnable = true;
     bool _isHide = false;
@@ -425,8 +566,22 @@ protected:
         if (_y < 0) {
             _y = CW_USEDEFAULT;
         }
+
+        // 先用原始尺寸创建窗口
         _CreateWindow(nullptr, __aWindowClass.GetName(), WS_OVERLAPPED | WS_SYSMENU | WS_MINIMIZEBOX,
             _title.c_str(), _x, _y, _width, _height);
+
+        // 根据实际 DPI 调整窗口大小
+        if (_hwnd && _dpi != 96) {
+            int scaledW = _Scale(_width, _dpi);
+            int scaledH = _Scale(_height, _dpi);
+            SetWindowPos(_hwnd, NULL, 0, 0, scaledW, scaledH, SWP_NOMOVE | SWP_NOZORDER);
+            _width = scaledW;
+            _height = scaledH;
+            _logicWidth = _width;
+            _logicHeight = _height;
+        }
+
         SetFont("Microsoft YaHei");
 
         auto msgLoop = [this] {
@@ -445,6 +600,7 @@ protected:
         };
         _tickRunner.Start(std::move(msgLoop), ATickRunner::AFTER_INJECT);
     }
+
     ATickRunner _tickRunner;
     std::string _title;
     int _x;
@@ -454,6 +610,7 @@ protected:
 
 class ACtrlConnHandle {
 public:
+    ACtrlConnHandle() = default;
     ACtrlConnHandle(AConnectControl* ptr)
         : _ptr(ptr)
     {
